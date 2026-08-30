@@ -5,15 +5,16 @@ use defmt::*;
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed};
-use embassy_stm32::{Config, bind_interrupts, can, dma, mode::Async, peripherals, usart};
+use embassy_stm32::{Config, bind_interrupts, can, peripherals, usart};
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel};
+use mavlink::embedded::Write;
 use panic_probe as _;
 
 use mavlink;
 use mavlink::dialects::swingby::MavMessage;
 use mavlink::{MAVLinkV2MessageRaw, read_v2_raw_message_async};
 
-use static_cell::ConstStaticCell;
+use static_cell::StaticCell;
 
 static UART_TO_CAN: Channel<ThreadModeRawMutex, MAVLinkV2MessageRaw, 8> = Channel::new();
 static CAN_TO_UART: Channel<ThreadModeRawMutex, MAVLinkV2MessageRaw, 8> = Channel::new();
@@ -21,9 +22,7 @@ static CAN_TO_UART: Channel<ThreadModeRawMutex, MAVLinkV2MessageRaw, 8> = Channe
 bind_interrupts!(struct Irqs {
     FDCAN1_IT0 => can::IT0InterruptHandler<peripherals::FDCAN1>;
     FDCAN1_IT1 => can::IT1InterruptHandler<peripherals::FDCAN1>;
-    USART3 => usart::InterruptHandler<peripherals::USART3>;
-    GPDMA1_CHANNEL0 => dma::InterruptHandler<peripherals::GPDMA1_CH0>;
-    GPDMA1_CHANNEL1 => dma::InterruptHandler<peripherals::GPDMA1_CH1>;
+    USART3 => usart::BufferedInterruptHandler<peripherals::USART3>;
 });
 
 #[embassy_executor::main]
@@ -49,10 +48,16 @@ async fn main(spawner: Spawner) {
 
     let mut config = usart::Config::default();
     config.baudrate = 115200;
-    let serial =
-        usart::Uart::new(p.USART3, p.PA3, p.PA4, p.GPDMA1_CH0, p.GPDMA1_CH1, Irqs, config).unwrap();
+
+    static RX_BUF : StaticCell<[u8;1024]>=StaticCell::new();
+    static TX_BUF : StaticCell<[u8;1024]>=StaticCell::new();
+    let rx_buf = &mut RX_BUF.init([0u8;1024])[..];
+    let tx_buf = &mut TX_BUF.init([0u8;1024])[..];
+
+    let uart3 =
+        usart::BufferedUart::new(p.USART3, p.PA3, p.PA4, tx_buf, rx_buf, Irqs, config).unwrap();
     // Break serial in TX and RX (not used)
-    let (uart_tx, uart_rx) = serial.split();
+    let (uart_tx, uart_rx) = uart3.split();
 
     let mut can = can::CanConfigurator::new(p.FDCAN1, p.PC6, p.PC7, Irqs);
 
@@ -123,16 +128,13 @@ pub async fn can_rx_task(mut rx: can::CanRx<'static>, mut led: Output<'static>) 
 }
 
 #[embassy_executor::task]
-pub async fn uart2_rx_task(rx: usart::UartRx<'static, Async>) {
-    // Make ring-buffered RX (over DMA)
-    static BUF_MEMORY: ConstStaticCell<[u8; 1024]> = ConstStaticCell::new([0; 1024]);
+pub async fn uart2_rx_task(mut rx: usart::BufferedUartRx<'static>) {
     debug!("rx task started");
-    let mut rx_buffered = rx.into_ring_buffered(BUF_MEMORY.take());
 
     loop {
         // Read raw message to reduce firmware flash size (using read_v2_msg_async will be add ~80KB because
         // all *_DATA::deser methods will be add to firmware).
-        let raw = read_v2_raw_message_async::<MavMessage>(&mut rx_buffered).await;
+        let raw = read_v2_raw_message_async::<MavMessage>(&mut rx).await;
         match raw {
             Ok(msg) => {
                 defmt::info!("UART  recieved raw message: msg_id={}", msg.message_id());
@@ -148,11 +150,11 @@ pub async fn uart2_rx_task(rx: usart::UartRx<'static, Async>) {
 }
 
 #[embassy_executor::task]
-pub async fn uart2_tx_task(mut tx: usart::UartTx<'static, Async>) {
+pub async fn uart2_tx_task(mut tx: usart::BufferedUartTx<'static>) {
     // Main loop
     loop {
         let msg = CAN_TO_UART.receive().await;
-        tx.write(msg.raw_bytes()).await.unwrap();
+        tx.write_all(msg.raw_bytes()).unwrap();
     }
 }
 
